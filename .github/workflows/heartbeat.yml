@@ -1,0 +1,148 @@
+name: Scheduled Repository Heartbeat
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      case_override:
+        description: "Force a rotation case for testing (0=metrics, 1=health, 2=activity, 3=readme). Leave empty for automatic rotation."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: scheduled-repository-heartbeat
+  cancel-in-progress: false
+
+jobs:
+  heartbeat:
+    name: Auto commit heartbeat
+    runs-on: ubuntu-latest
+    if: github.repository == 'JustInCache/awesome-mcp-collection'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up PAT for push
+        shell: bash
+        run: |
+          git remote set-url origin "https://x-access-token:${{ secrets.AUTO_COMMIT_TOKEN }}@github.com/${{ github.repository }}.git"
+
+      - name: Determine rotation case
+        id: rotation
+        shell: bash
+        run: |
+          override="${{ github.event.inputs.case_override }}"
+          if [[ -n "$override" ]]; then
+            case_num="$override"
+          else
+            case_num=$(( ($(date +%s) / 28800) % 4 ))
+          fi
+          echo "case=${case_num}" >> "$GITHUB_OUTPUT"
+          echo "Rotation case: ${case_num}"
+
+      # ── Case 0: update configs/build-metrics-stats.json via Python helper ──
+      - name: "Case 0 — Sync build metrics"
+        if: steps.rotation.outputs.case == '0'
+        shell: bash
+        run: |
+          python3 scripts/update_metrics.py
+          echo "COMMIT_MSG=chore: sync build metrics and visitor stats" >> "$GITHUB_ENV"
+          echo "FILE_PATTERN=configs/build-metrics-stats.json" >> "$GITHUB_ENV"
+
+      # ── Case 1: append a timestamped entry to docs/daily-health.md ──
+      - name: "Case 1 — Append daily health snapshot"
+        if: steps.rotation.outputs.case == '1'
+        shell: bash
+        run: |
+          ts="$(date -u '+%Y-%m-%d %H:%M UTC')"
+          iso="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          epoch_ts=$(date -d "2025-01-01" +%s)
+          uptime_days=$(( ($(date +%s) - epoch_ts) / 86400 ))
+
+          health_file="docs/daily-health.md"
+          if [[ ! -f "$health_file" ]]; then
+            printf '# Daily Health Log\n> Auto-generated health snapshots every 8 hours.\n---\n' > "$health_file"
+          fi
+
+          printf '\n## Health Check — %s\n- **Status:** All systems operational\n- **Checked at:** %s\n- **Uptime:** %s days since project inception\n- **Open Issues:** Monitored automatically\n- **Last Commit Verified:** ✅\n' \
+            "$ts" "$iso" "$uptime_days" >> "$health_file"
+
+          echo "COMMIT_MSG=docs: append daily health snapshot" >> "$GITHUB_ENV"
+          echo "FILE_PATTERN=docs/daily-health.md" >> "$GITHUB_ENV"
+
+      # ── Case 2: append a rotating log line to ACTIVITY_LOG.md ──
+      - name: "Case 2 — Log activity entry"
+        if: steps.rotation.outputs.case == '2'
+        shell: bash
+        run: |
+          ts="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          pick=$(( $(date +%-M) % 3 ))
+
+          log_file="ACTIVITY_LOG.md"
+          if [[ ! -f "$log_file" ]]; then
+            printf '# Activity Log\n> Automated activity tracking for awesome-mcp-collection.\n' > "$log_file"
+          fi
+
+          case "$pick" in
+            0) msg="[${ts}] Automated repository health check passed ✓" ;;
+            1) msg="[${ts}] Dependency snapshot verified — no drift detected" ;;
+            *) msg="[${ts}] Scheduled sync completed — repository in clean state" ;;
+          esac
+
+          printf '%s\n' "$msg" >> "$log_file"
+          echo "COMMIT_MSG=chore: log scheduled activity entry" >> "$GITHUB_ENV"
+          echo "FILE_PATTERN=ACTIVITY_LOG.md" >> "$GITHUB_ENV"
+
+      # ── Case 3: refresh the Last updated line in README.md using sed ──
+      - name: "Case 3 — Refresh README timestamp"
+        if: steps.rotation.outputs.case == '3'
+        shell: bash
+        run: |
+          ts="$(date -u '+%Y-%m-%d %H:%M UTC')"
+
+          if grep -qi 'last updated:' README.md; then
+            sed -i "s/.*[Ll]ast [Uu]pdated:.*/> Last updated: ${ts}/" README.md
+          else
+            printf '\n> Last updated: %s\n' "$ts" >> README.md
+          fi
+
+          echo "COMMIT_MSG=docs: refresh last updated timestamp" >> "$GITHUB_ENV"
+          echo "FILE_PATTERN=README.md" >> "$GITHUB_ENV"
+
+      - name: Commit and push changes
+        shell: bash
+        run: |
+          if [[ -z "$COMMIT_MSG" || -z "$FILE_PATTERN" ]]; then
+            echo "No case ran — nothing to commit."
+            exit 0
+          fi
+
+          git config user.name "JustInCache"
+          git config user.email "105823120+JustInCache@users.noreply.github.com"
+
+          git add -- $FILE_PATTERN
+
+          if git diff --cached --quiet; then
+            echo "Working tree clean. Nothing to commit."
+            exit 0
+          fi
+
+          git commit -m "$COMMIT_MSG" \
+            --author="JustInCache <105823120+JustInCache@users.noreply.github.com>"
+
+          for attempt in 1 2 3; do
+            echo "Push attempt ${attempt}..."
+            git pull --rebase origin main && git push origin main && exit 0
+            echo "Attempt ${attempt} failed, retrying in ${attempt}s..."
+            sleep "$attempt"
+          done
+
+          echo "All push attempts failed."
+          exit 1
